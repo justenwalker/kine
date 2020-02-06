@@ -7,6 +7,8 @@ import (
 	"os"
 	"strings"
 
+	"github.com/rancher/kine/pkg/drivers/spanner"
+
 	"github.com/pkg/errors"
 	"github.com/rancher/kine/pkg/drivers/dqlite"
 	"github.com/rancher/kine/pkg/drivers/mysql"
@@ -20,6 +22,7 @@ import (
 
 const (
 	KineSocket      = "unix://kine.sock"
+	SpannerBackend  = "spanner"
 	SQLiteBackend   = "sqlite"
 	DQLiteBackend   = "dqlite"
 	ETCDBackend     = "etcd3"
@@ -122,6 +125,9 @@ func getKineStorageBackend(ctx context.Context, driver, dsn string, cfg Config) 
 		err         error
 	)
 	switch driver {
+	case SpannerBackend:
+		leaderElect = false
+		backend, err = spanner.New(ctx, dsn)
 	case SQLiteBackend:
 		leaderElect = false
 		backend, err = sqlite.New(ctx, dsn)

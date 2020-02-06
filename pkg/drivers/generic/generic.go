@@ -69,6 +69,7 @@ type Generic struct {
 
 	LockWrites            bool
 	LastInsertID          bool
+	NoAutoIncrement       bool
 	DB                    *sql.DB
 	GetCurrentSQL         string
 	GetRevisionSQL        string
@@ -80,11 +81,14 @@ type Generic struct {
 	DeleteSQL             string
 	UpdateCompactSQL      string
 	InsertSQL             string
+	GetNextIDSQL          string
 	FillSQL               string
 	InsertLastInsertIDSQL string
 	Retry                 ErrRetry
 	TranslateErr          TranslateErr
 }
+
+const RetryCount uint = 20
 
 func q(sql, param string, numbered bool) string {
 	if param == "?" && !numbered {
@@ -199,7 +203,7 @@ func Open(ctx context.Context, driverName, dataSourceName string, paramCharacter
 			UPDATE kine
 			SET prev_revision = ?
 			WHERE name = 'compact_rev_key'`, paramCharacter, numbered),
-
+		GetNextIDSQL: `SELECT MAX(id) + 1 FROM kine`,
 		InsertLastInsertIDSQL: q(`INSERT INTO kine(name, created, deleted, create_revision, prev_revision, lease, value, old_value)
 			values(?, ?, ?, ?, ?, ?, ?, ?)`, paramCharacter, numbered),
 
@@ -228,7 +232,7 @@ func (d *Generic) execute(ctx context.Context, sql string, args ...interface{}) 
 	}
 
 	wait := strategy.Backoff(backoff.Linear(100 + time.Millisecond))
-	for i := uint(0); i < 20; i++ {
+	for i := uint(0); i < RetryCount; i++ {
 		if i > 2 {
 			logrus.Debugf("EXEC (try: %d) %v : %s", i, args, Stripped(sql))
 		} else {
@@ -347,6 +351,11 @@ func (d *Generic) Insert(ctx context.Context, key string, create, delete bool, c
 	if delete {
 		dVal = 1
 	}
+	logrus.Debugln("Insert", key, create, delete, createRevision, previousRevision, ttl, value, prevValue)
+	if d.NoAutoIncrement {
+		id, err = d.InsertNoAutoIncrement(ctx, d.FillSQL, key, cVal, dVal, createRevision, previousRevision, ttl, value, prevValue)
+		return
+	}
 
 	if d.LastInsertID {
 		row, err := d.execute(ctx, d.InsertLastInsertIDSQL, key, cVal, dVal, createRevision, previousRevision, ttl, value, prevValue)
@@ -359,4 +368,85 @@ func (d *Generic) Insert(ctx context.Context, key string, create, delete bool, c
 	row := d.queryRow(ctx, d.InsertSQL, key, cVal, dVal, createRevision, previousRevision, ttl, value, prevValue)
 	err = row.Scan(&id)
 	return id, err
+}
+
+func (d *Generic) InsertNoAutoIncrement(ctx context.Context, sql string, args ...interface{}) (int64, error) {
+	if d.LockWrites {
+		d.Lock()
+		defer d.Unlock()
+	}
+	var err error
+	var id int64
+	wait := strategy.Backoff(backoff.Linear(100 + time.Millisecond))
+	for i := uint(0); i < RetryCount; i++ {
+		if id, err = d.insertNoAutoIncrementTransaction(ctx, i, sql, args...); err != nil && d.Retry != nil && d.Retry(err) {
+			wait(i)
+			continue
+		}
+		break
+	}
+	return id, err
+}
+
+func (d *Generic) insertNoAutoIncrementTransaction(ctx context.Context, try uint, q string, args ...interface{}) (id int64, err error) {
+	var tx *sql.Tx
+	tx, err = d.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		if err != nil {
+			logrus.WithError(err).Errorf("rollback: %s <= %v", q, args)
+			_ = tx.Rollback()
+		} else {
+			err = tx.Commit()
+			logrus.WithError(err).Debugf("commit: %s <= %v", q, args)
+		}
+	}()
+	id, err = d.getNextAutoIncrementID(ctx, try, tx)
+	if err != nil {
+		logrus.WithError(err).Errorf("getNextAutoIncrementID failure")
+		return
+	}
+	argsWithID := append([]interface{}{id}, args...)
+	if err = d.executeInTransaction(ctx, try, tx, q, argsWithID...); err != nil {
+		logrus.WithError(err).Errorf("executeInTransaction failure")
+	}
+	return
+}
+
+func (d *Generic) getNextAutoIncrementID(ctx context.Context, try uint, tx *sql.Tx) (int64, error) {
+	if try > 2 {
+		logrus.Debugf("QUERY (try: %d) : %s", try, Stripped(d.GetNextIDSQL))
+	} else {
+		logrus.Tracef("QUERY (try: %d) : %s", try, Stripped(d.GetNextIDSQL))
+	}
+	var id sql.NullInt64
+	row := tx.QueryRowContext(ctx, d.GetNextIDSQL)
+	if err := row.Scan(&id); err != nil {
+		if err == sql.ErrNoRows {
+			logrus.Debugln("First ID: ", 0)
+			return 0, nil
+		}
+		logrus.WithError(err).Errorln("Scan Error")
+	}
+	if id.Valid {
+		logrus.Debugln("Next ID:", id.Int64)
+		return id.Int64, nil
+	}
+	logrus.Debugln("Next ID: 0")
+	return 0, nil
+}
+
+func (d *Generic) executeInTransaction(ctx context.Context, try uint, tx *sql.Tx, sql string, args ...interface{}) error {
+	if try > 2 {
+		logrus.Debugf("EXEC (try: %d) %v : %s", try, args, Stripped(sql))
+	} else {
+		logrus.Tracef("EXEC (try: %d) %v : %s", try, args, Stripped(sql))
+	}
+	_, err := tx.ExecContext(ctx, sql, args...)
+	if err != nil {
+		return err
+	}
+	return nil
 }
